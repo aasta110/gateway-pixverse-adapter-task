@@ -60,7 +60,11 @@ async def submit(client: httpx.AsyncClient, model: str, body: dict) -> str:
     if isinstance(response, httpx.RequestError):
         if isinstance(response, (httpx.ConnectError, httpx.ConnectTimeout)):
             raise RelayError(502, "Could not connect to PixVerse; the job was not sent")
-        raise RelayError(502, "PixVerse did not answer; the job may have been created")
+        if isinstance(response, httpx.TransportError):
+            raise RelayError(
+                502, "PixVerse did not answer; the job may have been created"
+            )
+        raise RelayError(502, "PixVerse returned an invalid response")
 
     status = response.status_code
     if not response.is_success:
@@ -103,8 +107,12 @@ async def poll(
         return _error("PixVerse API key is not configured")
 
     response = await _send(client, "GET", RESULT_PATH.format(task_id), key)
-    if isinstance(response, httpx.RequestError):
+    # Only a failed exchange is retryable. Any other httpx error (DecodingError
+    # from a transport that decodes for itself) means a reply arrived unreadable.
+    if isinstance(response, httpx.TransportError):
         return PROCESSING
+    if isinstance(response, httpx.RequestError):
+        return _error("PixVerse returned an invalid response")
     status = response.status_code
     if status == 429 or status >= 500:
         return PROCESSING
@@ -185,19 +193,28 @@ async def _send(
     key: str,
     json: dict | None = None,
 ) -> httpx.Response | httpx.RequestError:
-    """Make one request and return the response or the transport error.
+    """Make one request and return the response or the httpx error.
 
     Callers raise their own error outside this ``except`` block, so the httpx
     exception, which holds the request headers, is never chained to it.
     Redirects are refused so the API key cannot be forwarded to another host.
+    The body is read after the status line, so a body httpx cannot decode
+    (``Content-Encoding: gzip`` over plain bytes, say) comes back as an empty
+    body with the real HTTP status and is judged like any unparseable reply.
     """
     headers = {"API-KEY": key, "Ai-trace-id": str(uuid.uuid4())}
+    request = client.build_request(method, path, json=json, headers=headers)
     try:
-        return await client.request(
-            method, path, json=json, headers=headers, follow_redirects=False
-        )
+        response = await client.send(request, stream=True, follow_redirects=False)
+        try:
+            await response.aread()
+        except httpx.DecodingError:
+            return httpx.Response(response.status_code, request=request)
+        finally:
+            await response.aclose()
     except httpx.RequestError as error:
         return error
+    return response
 
 
 def _envelope(response: httpx.Response) -> tuple[int, object] | None:

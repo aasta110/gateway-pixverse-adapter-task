@@ -68,6 +68,27 @@ def app_error(code):
     return {"ErrCode": code, "ErrMsg": PROVIDER_TEXT, "Resp": None}
 
 
+def gzip_mismatch(status):
+    """A reply labelled gzip whose body is not gzip.
+
+    The body is streamed, as a real transport delivers it, so httpx raises
+    DecodingError only after the status line has arrived.
+    """
+
+    async def body():
+        yield b"not gzip"
+
+    return httpx.Response(status, headers={"Content-Encoding": "gzip"}, content=body())
+
+
+def gzip_mismatch_decoded_by_transport(request):
+    # Building the reply with bytes decodes it at once, so httpx raises
+    # DecodingError inside the transport, before any status reaches the adapter.
+    return httpx.Response(
+        200, headers={"Content-Encoding": "gzip"}, content=b"not gzip"
+    )
+
+
 class Provider:
     """MockTransport handler that replays scripted replies and records requests."""
 
@@ -354,6 +375,21 @@ def test_submit_malformed_response_is_rejected(content):
     assert (error.status, error.upstream_status) == (502, 200)
 
 
+def test_submit_undecodable_body_is_a_malformed_response():
+    provider = Provider(gzip_mismatch(200), submit_ok())
+
+    error = submit_error(provider)
+
+    assert (error.status, error.upstream_status) == (502, 200)
+    assert error.message == "PixVerse returned an invalid response"
+    assert error.__cause__ is None and error.__context__ is None
+    assert len(provider.requests) == 1
+    # No status reached the adapter, so there is none to report.
+    error = submit_error(gzip_mismatch_decoded_by_transport)
+    assert (error.status, error.upstream_status) == (502, None)
+    assert error.message == "PixVerse returned an invalid response"
+
+
 @pytest.mark.parametrize(
     "reply",
     [httpx.Response(201, json=app_error(500044)), httpx.Response(202, content=b"[]")],
@@ -597,6 +633,32 @@ def test_poll_malformed_response_is_error(content):
     status, url, error, usage = poll(Provider(httpx.Response(200, content=content)))
 
     assert (status, url, usage) == ("error", None, None) and error
+
+
+@pytest.mark.parametrize(
+    "status, expected",
+    [(200, "error"), (404, "error"), (429, "processing"), (503, "processing")],
+)
+def test_poll_undecodable_body_is_judged_by_http_status_first(status, expected):
+    # httpx.DecodingError is a RequestError, but it is not a network failure.
+    provider = Provider(gzip_mismatch(status))
+
+    result_status, url, error, usage = poll(provider)
+
+    assert (result_status, url, usage) == (expected, None, None)
+    assert (error is None) == (expected == "processing")
+    assert provider.methods == ["GET"]
+
+
+def test_poll_body_the_transport_cannot_decode_is_error():
+    status, url, error, usage = poll(gzip_mismatch_decoded_by_transport)
+
+    assert (status, url, error, usage) == (
+        "error",
+        None,
+        "PixVerse returned an invalid response",
+        None,
+    )
 
 
 @pytest.mark.parametrize(

@@ -55,9 +55,9 @@ PixVerse's own MCP client ([PixVerseAI/PixVerse-MCP](https://github.com/PixVerse
 
 | Provider result | Gateway |
 | --- | --- |
-| network error or timeout, HTTP 429, HTTP 5xx | `processing` |
+| network error or timeout (an httpx `TransportError`), HTTP 429, HTTP 5xx | `processing` |
 | other non-2xx (including redirects) | `error` |
-| invalid JSON or envelope, nonzero `ErrCode` | `error` |
+| invalid JSON or envelope, a body httpx cannot decode, nonzero `ErrCode` | `error` |
 | `status` 5 | `processing` |
 | `status` 1 with a usable URL | `done` |
 | `status` 1 without a usable URL | `error` |
@@ -65,6 +65,8 @@ PixVerse's own MCP client ([PixVerseAI/PixVerse-MCP](https://github.com/PixVerse
 | any other or missing `status`, or a non-int such as `"1"` or `true` | `error` |
 
 A usable URL is visible ASCII with no backslash, scheme `https`, a DNS-style hostname (letters, digits, `-`, `_` and single dots; IP-literal hosts are rejected), no `@` in the authority and a valid port. Deeply nested JSON, which makes Python's parser raise `RecursionError`, is treated as malformed. The character check runs first because `urlsplit` silently removes embedded newlines and tabs. `usage` is always `None`: the result schema has no usage field, and fetching credits would need a second request.
+
+**Undecodable bodies (fixed after review).** httpx raises `DecodingError` when a body does not match its `Content-Encoding`, and `DecodingError` is a `RequestError`. The first version therefore treated an HTTP 200 labelled gzip but carrying plain bytes as a network error: `poll` returned `processing` and `submit` said PixVerse did not answer. Now the status line is read before the body (`send(stream=True)`, then `aread()`), and a body that cannot be decoded is checked like one that cannot be parsed. The HTTP status still decides first, so 429 and 5xx stay `processing`, other non-2xx are errors with their status, and a 2xx becomes `error` on poll and `RelayError(502, ..., upstream_status=<status>)` on submit. Only `httpx.TransportError` (timeouts, connection and protocol failures) counts as a retryable network failure. If a transport decodes the body itself, as `MockTransport` does when a reply is built from bytes, no status reaches the adapter: poll returns `error` and submit reports `upstream_status=None`.
 
 **Errors.** Messages are fixed strings, plus PixVerse's numeric error code or the HTTP status. `ErrMsg`, response bodies, the prompt and the key never appear. Transport errors are converted outside the `except` block, so the httpx exception (which holds the request headers) is not chained to the `RelayError`.
 
@@ -79,13 +81,13 @@ A usable URL is visible ASCII with no backslash, scheme `https`, a DNS-style hos
 `make` is not installed on the Windows machine used, so the Makefile targets were run directly with uv 0.10.12 on Python 3.12.13 (httpx 0.28.1, pytest 8.3.5, as in CI):
 
 - `uv run --frozen pytest -q tests/test_runner.py` (= `make starter-check`): 9 passed.
-- `uv run --frozen pytest -q` (= `make verify`): 203 passed.
+- `uv run --frozen pytest -q` (= `make verify`): 209 passed.
 - `git diff --check`: clean. Files use LF endings to match the Linux CI.
 - `uvx ruff check`: only I001 (import grouping), which the supplied `contracts.py` also triggers; the scaffold's style is kept. `uv run --with mypy mypy gateway_task/adapters/pixverse.py`: no issues.
 
 The offline end-to-end tests run the supplied `run_job()` with the real adapter against `httpx.MockTransport`: submit → processing → success, transient poll failures (503, timeout, 429) → success with one POST, moderation failure, the poll limit, and a submit timeout that is not resubmitted. An autouse fixture makes any real `AsyncHTTPTransport` request fail the test.
 
-**Breaking the code on purpose.** 37 rules in the adapter were broken one at a time, running the suite after each. Examples: accept a boolean seed, retry a submit, reuse the trace ID, treat status 6 as processing, accept `http://`, enable audio, follow redirects, accept `ErrCode: false`, route the ID through `float`, make 429 an error, check task IDs with `isdigit()`, mutate the caller's body, use the 2048 limit, chain the httpx exception, create a hidden client, change the client's timeout, hardcode the origin, print the key, report upstream 200 for a 201 reply. A test failed every time. One break first survived: ignoring a nonzero `ErrCode` on submit, because every error fixture happened to lack a `video_id`. A test where an error reply still carries one was added.
+**Breaking the code on purpose.** 37 rules in the adapter were broken one at a time, running the suite after each. Examples: accept a boolean seed, retry a submit, reuse the trace ID, treat status 6 as processing, accept `http://`, enable audio, follow redirects, accept `ErrCode: false`, route the ID through `float`, make 429 an error, check task IDs with `isdigit()`, mutate the caller's body, use the 2048 limit, chain the httpx exception, create a hidden client, change the client's timeout, hardcode the origin, print the key, report upstream 200 for a 201 reply. A test failed every time. One break first survived: ignoring a nonzero `ErrCode` on submit, because every error fixture happened to lack a `video_id`. A test where an error reply still carries one was added. For the review fix, the new tests failed on the previous adapter, and five more breaks were each caught: retry every `RequestError` on poll, stop catching `DecodingError` while reading the body, report a fixed status instead of the real one, drop the status entirely, and call a decoding failure on submit "did not answer".
 
 **Not verified against a live provider.** All provider replies are synthetic fixtures based on the docs. No PixVerse account, key or paid call was used. Unverified: real HTTP statuses for errors, the real failure body, whether statuses 2/3 occur, whether `video_id` ever exceeds 64 bits, and the real result URL host.
 
