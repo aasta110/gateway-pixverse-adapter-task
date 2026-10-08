@@ -101,7 +101,7 @@ Correction: after the first research pass the plan looked ready to build, but I 
 
 ## Time and remaining work
 
-About 2 hours of wall-clock time, including research, tests, review and these notes.
+About 4–5 hours in total, including research, tests, review and these notes.
 
 Implementation gaps: none known within TASK.md. Open questions for PixVerse: statuses 2/3, failure body shape and HTTP statuses, trace-ID dedup guarantees.
 
